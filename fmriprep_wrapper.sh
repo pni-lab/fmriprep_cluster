@@ -2,7 +2,7 @@
 
 
 # Set default values
-MAX_JOBS=16
+MAX_JOBS=50
 NICE=5
 SUBMIT_DELAY=72
 CPUS_PER_TASK=15
@@ -63,15 +63,16 @@ for participant_folder in ${INDIR}/sub-*; do
 #SBATCH --job-name=${PARTICIPANT_ID}
 #SBATCH --output="${LOG_PATH}/${PARTICIPANT_ID}.out"
 #SBATCH --error="${LOG_PATH}/${PARTICIPANT_ID}.out"
-#SBATCH --time=48:00:00
+#SBATCH --time=96:00:00
 #SBATCH --nice=${NICE}
 #SBATCH --cpus-per-task ${CPUS_PER_TASK}
+#SBATCH --mem=90G
 
 echo "*************************************************************"
 echo "Starting on \$(hostname) at \$(date +"%T")"
 echo "*************************************************************"
 
-TMP_LOCAL="/local/work/renglert/A01/${PARTICIPANT_ID}"
+TMP_LOCAL="/local/work/$(whoami)/A01/${PARTICIPANT_ID}"
 echo "\${TMP_LOCAL}"
 
 # directory for single sub BIDS
@@ -91,8 +92,8 @@ rm -rf "\${participant_tmp}"
 mkdir -p "\${participant_tmp}"
 
 # copy the participant data and the description.json from the NFS to the node
-cp -vr "${participant_folder}" "\${participant_data_in}"
-cp -v "${dataset_description_path}" "\${participant_data_in}"
+rsync -a --copy-links "${participant_folder}" "\${participant_data_in}"
+rsync -a --copy-links "${dataset_description_path}" "\${participant_data_in}"
 
 # create local copy of the freesurfer license
 cp -v "${FREESURFER_LICENSE}" "\${TMP_LOCAL}/tmp/freesurfer_license.txt"
@@ -101,8 +102,8 @@ cp -v "${FREESURFER_LICENSE}" "\${TMP_LOCAL}/tmp/freesurfer_license.txt"
 mkdir -p "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/
 cp "${CONTAINER}" "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/fmriprep.sif
 
-apptainer exec -B "\${TMP_LOCAL}":"\${TMP_LOCAL}" --writable-tmpfs "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/fmriprep.sif \
-	bash -c "fmriprep \${participant_data_in} \${participant_data_out} participant -w \${participant_tmp} --fs-license-file \${TMP_LOCAL}/tmp/freesurfer_license.txt"
+apptainer exec -B "\${TMP_LOCAL}":"\${TMP_LOCAL}" "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/fmriprep.sif \
+bash -c "fmriprep \${participant_data_in} \${participant_data_out} participant -w \${participant_tmp} --nprocs 8 --mem 80000 --omp-nthreads 4 -t rest --output-spaces func MNI152NLin2009cAsym:res-2 --fs-license-file \${TMP_LOCAL}/tmp/freesurfer_license.txt"
 
 echo "******************** PARTICIPANT INPUT TREE ****************************"
 tree \${participant_data_in}
