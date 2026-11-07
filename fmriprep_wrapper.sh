@@ -1,11 +1,16 @@
 #!/bin/bash
+#SBATCH --time=336:00:00
+#SBATCH --partition=cpu_nodes
+#SBATCH --cpus-per-task 8
+#SBATCH --mem=8G
 
 
 # Set default values
-MAX_JOBS=16
+MAX_JOBS=21
 NICE=5
-SUBMIT_DELAY=72
+SUBMIT_DELAY=90  # DO NOT DECREASE - only increase if wanted
 CPUS_PER_TASK=15
+REQUIRED_VERSION="25.2.7"
 
 
 # this is called with the -h help function
@@ -13,7 +18,7 @@ usage() {
       echo "-i      Input BIDS dataset"
       echo "-o      Derivatives dir (i.e., where to store the results)"
       echo "-a      Path to the fmriprep.sif apptainer file"
-      echo "-t      Where to store temporary files on the cluster, should be in TMPDIR/yourname or /local/work"
+      echo "-t      Where to store temporary files on the cluster, should be in /local/work"
       echo "-f      link to the freesurfer license"
       echo "-l      NFS directory that should be used to store the slurm log files "
       echo "-m      Maximum amount of jobs that you want to have running at a time (default: '${MAX_JOBS}')"
@@ -37,13 +42,33 @@ while getopts "i:o:a:t:f:l:m:n:d:c:h" opt; do
     d) SUBMIT_DELAY="$OPTARG";;
     c) CPUS_PER_TASK="$OPTARG";;
 
-    h) usage;;
+    h) usage; exit 0;;
     # catch invalid args
     \?) echo "Invalid option: -$OPTARG" >&2; usage; exit 1;;
     # catch missing args
     :) echo "Option -$OPTARG requires an argument." >&2; usage; exit 1;;
   esac
 done
+
+echo "Verifying temporary directory is in /local..."
+if [[ "${TMP_FMRIPREP}" != /local/* ]]; then
+    echo "Error: Temporary directory must be in /local"
+    echo "Current value: ${TMP_FMRIPREP}"
+    echo "Please specify a path starting with /local/"
+    exit 1
+fi
+
+# Check the container exists and is the required fMRIPrep version before submitting anything
+if [[ ! -f "${CONTAINER}" ]]; then
+    echo "Error: container not found: ${CONTAINER}"
+    exit 1
+fi
+CONTAINER_VERSION=$(apptainer exec --cleanenv "${CONTAINER}" fmriprep --version 2>&1)
+echo "Container reports: ${CONTAINER_VERSION}"
+if [[ "${CONTAINER_VERSION}" != *"${REQUIRED_VERSION}"* ]]; then
+    echo "Error: expected fMRIPrep ${REQUIRED_VERSION}, got: ${CONTAINER_VERSION}"
+    exit 1
+fi
 
 # Every sub-dataset (containing only one subject) still needs a dataset_description.json
 dataset_description_path="${INDIR}/dataset_description.json"
@@ -63,15 +88,14 @@ for participant_folder in ${INDIR}/sub-*; do
 #SBATCH --job-name=${PARTICIPANT_ID}
 #SBATCH --output="${LOG_PATH}/${PARTICIPANT_ID}.out"
 #SBATCH --error="${LOG_PATH}/${PARTICIPANT_ID}.out"
-#SBATCH --time=48:00:00
+#SBATCH --time=96:00:00
 #SBATCH --nice=${NICE}
 #SBATCH --cpus-per-task ${CPUS_PER_TASK}
+#SBATCH --mem=90G
 
-echo "*************************************************************"
-echo "Starting on \$(hostname) at \$(date +"%T")"
-echo "*************************************************************"
+echo "****** Starting on \$(hostname) at \$(date +"%T") ******"
 
-TMP_LOCAL="/local/work/renglert/A01/${PARTICIPANT_ID}"
+TMP_LOCAL="${TMP_FMRIPREP}/jobs/${PARTICIPANT_ID}"
 echo "\${TMP_LOCAL}"
 
 # directory for single sub BIDS
@@ -91,33 +115,39 @@ rm -rf "\${participant_tmp}"
 mkdir -p "\${participant_tmp}"
 
 # copy the participant data and the description.json from the NFS to the node
-cp -vr "${participant_folder}" "\${participant_data_in}"
-cp -v "${dataset_description_path}" "\${participant_data_in}"
+rsync -a --copy-links "${participant_folder}" "\${participant_data_in}"
+rsync -a --copy-links "${dataset_description_path}" "\${participant_data_in}"
 
 # create local copy of the freesurfer license
-cp -v "${FREESURFER_LICENSE}" "\${TMP_LOCAL}/tmp/freesurfer_license.txt"
+cp "${FREESURFER_LICENSE}" "\${TMP_LOCAL}/tmp/freesurfer_license.txt"
 
 # copy the apptainer image
-mkdir -p "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/
-cp "${CONTAINER}" "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/fmriprep.sif
+SIF="\${TMP_LOCAL}/apptainer_image/${PARTICIPANT_ID}/fmriprep.sif"
+mkdir -p "\$(dirname "\${SIF}")"
+cp "${CONTAINER}" "\${SIF}"
 
-apptainer exec -B "\${TMP_LOCAL}":"\${TMP_LOCAL}" --writable-tmpfs "\${TMP_LOCAL}"/apptainer_image/"${PARTICIPANT_ID}"/fmriprep.sif \
-	bash -c "fmriprep \${participant_data_in} \${participant_data_out} participant -w \${participant_tmp} --fs-license-file \${TMP_LOCAL}/tmp/freesurfer_license.txt"
+# NEW: verify the fMRIPrep version on the compute node as well
+FMRIPREP_VERSION=\$(apptainer exec --cleanenv "\${SIF}" fmriprep --version 2>&1)
+echo "fMRIPrep version: \${FMRIPREP_VERSION}"
+if [[ "\${FMRIPREP_VERSION}" != *"${REQUIRED_VERSION}"* ]]; then
+    echo "ERROR: expected fMRIPrep ${REQUIRED_VERSION}, aborting."
+    rm -rf "\${TMP_LOCAL}"
+    exit 1
+fi
 
-echo "******************** PARTICIPANT INPUT TREE ****************************"
-tree \${participant_data_in}
-echo "***************************************************************"
-echo ""
-echo "******************** PARTICIPANT TMP TREE ****************************"
-tree \${participant_tmp}
-echo "***************************************************************"
-echo ""
-echo "******************** PARTICIPANT DATA OUT TREE ****************************"
-tree \${participant_data_out}
-echo "***********************************************************************"
+apptainer exec --cleanenv -B "\${TMP_LOCAL}":"\${TMP_LOCAL}" "\${SIF}" \\
+    fmriprep "\${participant_data_in}" "\${participant_data_out}" participant \\
+    -w "\${participant_tmp}" \\
+    --output-spaces anat func MNI152NLin2009cAsym:res-2 \\
+    --nthreads ${CPUS_PER_TASK} \\
+    --omp-nthreads 4 \\
+    --mem_mb 80000 \\
+    --fs-license-file "\${TMP_LOCAL}/tmp/freesurfer_license.txt"
+FMRIPREP_EXIT=\$?
+echo "fMRIPrep exit code: \${FMRIPREP_EXIT}"
 
 # Move results to the output directory
-cp -vr \${participant_data_out}/* ${OUTDIR}/
+cp -r \${participant_data_out}/* "${OUTDIR}/"
 
 # Remove (most) files from cluster
 rm -rf "\${participant_data_in}"
@@ -125,10 +155,9 @@ rm -rf "\${participant_data_out}"
 rm -rf "\${participant_tmp}"
 rm -rf "\${TMP_LOCAL}"
 
+echo "****** Ended on \$(hostname) at \$(date +"%T") "******"
 
-echo "*************************************************************"
-echo "Ended on \$(hostname) at \$(date +"%T")"
-echo "*************************************************************"
+exit \${FMRIPREP_EXIT}
 
 EOF
 
@@ -150,8 +179,6 @@ EOF
 done
 
 # clean the tmp folder on the wrapper node
-rm -rf "\${TMP_FMRIPREP}"
+rm -rf "${TMP_FMRIPREP}/job_scripts"
 
-echo "--------------------------------------------------------------------"
-echo "Last job script was submitted..."
-echo "--------------------------------------------------------------------"
+echo "****** Last job script was submitted... ******"
